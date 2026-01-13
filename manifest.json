@@ -1,0 +1,10 @@
+{
+	"id": "hugo-export",
+	"name": "Hugo Export",
+	"version": "0.1.0",
+	"minAppVersion": "0.15.0",
+	"description": "Export journal entries from Obsidian to Hugo with proper frontmatter",
+	"author": "samf",
+	"authorUrl": "https://github.com/samf",
+	"isDesktopOnly": false
+}
