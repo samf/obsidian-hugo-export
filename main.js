@@ -2704,6 +2704,8 @@ var safeDump = renamed("safeDump", "dump");
 // main.ts
 var DEFAULT_SETTINGS = {
   hugoExportPath: "",
+  hugoAttachmentsPath: "",
+  hugoAttachmentsUrl: "/images",
   defaultAuthor: ""
 };
 var HugoExportPlugin = class extends import_obsidian.Plugin {
@@ -2739,7 +2741,21 @@ var HugoExportPlugin = class extends import_obsidian.Plugin {
       return;
     }
     try {
-      const content = await this.app.vault.read(file);
+      let content = await this.app.vault.read(file);
+      const attachmentMap = /* @__PURE__ */ new Map();
+      if (this.settings.hugoAttachmentsPath) {
+        const attachmentNames = this.findAttachments(content);
+        for (const attachmentName of attachmentNames) {
+          const attachmentFile = await this.resolveAttachmentPath(attachmentName, file);
+          if (attachmentFile) {
+            const newFilename = await this.copyAttachment(attachmentFile, this.settings.hugoAttachmentsPath);
+            attachmentMap.set(attachmentName, newFilename);
+          } else {
+            console.warn(`Attachment not found: ${attachmentName}`);
+          }
+        }
+        content = this.convertAttachmentLinks(content, attachmentMap, this.settings.hugoAttachmentsUrl);
+      }
       const hugoContent = this.convertToHugo(content, file);
       const filename = this.generateHugoFilename(file);
       const exportPath = path.join(this.settings.hugoExportPath, filename);
@@ -2748,7 +2764,12 @@ var HugoExportPlugin = class extends import_obsidian.Plugin {
         fs.mkdirSync(dir, { recursive: true });
       }
       fs.writeFileSync(exportPath, hugoContent, "utf-8");
-      new import_obsidian.Notice(`Exported to: ${exportPath}`);
+      const attachmentCount = attachmentMap.size;
+      if (attachmentCount > 0) {
+        new import_obsidian.Notice(`Exported to: ${exportPath} (${attachmentCount} attachment${attachmentCount > 1 ? "s" : ""} copied)`);
+      } else {
+        new import_obsidian.Notice(`Exported to: ${exportPath}`);
+      }
     } catch (error) {
       console.error("Export failed:", error);
       new import_obsidian.Notice(`Export failed: ${error.message}`);
@@ -2814,6 +2835,60 @@ draft: false
     const sanitized = basename.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
     return `${sanitized}.md`;
   }
+  findAttachments(content) {
+    const embedRegex = /!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+    const attachments = [];
+    let match;
+    while ((match = embedRegex.exec(content)) !== null) {
+      attachments.push(match[1]);
+    }
+    return attachments;
+  }
+  async resolveAttachmentPath(filename, sourceFile) {
+    let file = this.app.vault.getAbstractFileByPath(filename);
+    if (file instanceof import_obsidian.TFile) {
+      return file;
+    }
+    const hasExtension = /\.[^.]+$/.test(filename);
+    if (!hasExtension) {
+      const extensions = ["png", "jpg", "jpeg", "gif", "webp", "svg", "pdf"];
+      for (const ext of extensions) {
+        file = this.app.vault.getAbstractFileByPath(`${filename}.${ext}`);
+        if (file instanceof import_obsidian.TFile) {
+          return file;
+        }
+      }
+    }
+    const resolved = this.app.metadataCache.getFirstLinkpathDest(filename, sourceFile.path);
+    if (resolved) {
+      return resolved;
+    }
+    return null;
+  }
+  async copyAttachment(attachmentFile, destDir) {
+    const content = await this.app.vault.readBinary(attachmentFile);
+    const sanitizedName = attachmentFile.name.replace(/[^a-z0-9.-]/gi, "-").toLowerCase();
+    if (!fs.existsSync(destDir)) {
+      fs.mkdirSync(destDir, { recursive: true });
+    }
+    const destPath = path.join(destDir, sanitizedName);
+    fs.writeFileSync(destPath, Buffer.from(content));
+    return sanitizedName;
+  }
+  convertAttachmentLinks(content, attachmentMap, hugoImagePath) {
+    return content.replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (match, filename, alt) => {
+      const newFilename = attachmentMap.get(filename);
+      if (newFilename) {
+        const src = `${hugoImagePath}/${newFilename}`;
+        if (alt) {
+          return `{{< figure src="${src}" alt="${alt}" caption="${alt}" >}}`;
+        } else {
+          return `{{< figure src="${src}" >}}`;
+        }
+      }
+      return match;
+    });
+  }
 };
 var HugoExportSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
@@ -2825,6 +2900,14 @@ var HugoExportSettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Hugo export path").setDesc("Path to your Hugo content directory (e.g., /Users/you/blog/content/posts)").addText((text) => text.setPlaceholder("/path/to/hugo/content/posts").setValue(this.plugin.settings.hugoExportPath).onChange(async (value) => {
       this.plugin.settings.hugoExportPath = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Hugo attachments path").setDesc("Filesystem path for attachments/images (e.g., /Users/you/blog/static/images)").addText((text) => text.setPlaceholder("/path/to/hugo/static/images").setValue(this.plugin.settings.hugoAttachmentsPath).onChange(async (value) => {
+      this.plugin.settings.hugoAttachmentsPath = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Hugo attachments URL").setDesc("URL path for images in markdown (e.g., /images)").addText((text) => text.setPlaceholder("/images").setValue(this.plugin.settings.hugoAttachmentsUrl).onChange(async (value) => {
+      this.plugin.settings.hugoAttachmentsUrl = value;
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl).setName("Default author").setDesc("Your name to use in the author field").addText((text) => text.setPlaceholder("Your Name").setValue(this.plugin.settings.defaultAuthor).onChange(async (value) => {
