@@ -10179,6 +10179,7 @@ var HugoExportPlugin = class extends import_obsidian.Plugin {
         content = this.convertAttachmentLinks(content, attachmentMap, this.settings.hugoAttachmentsUrl);
       }
       content = this.convertExternalImages(content);
+      content = this.convertHtmlImages(content);
       const hugoContent = this.convertToHugo(content, file);
       const filename = this.generateHugoFilename(file);
       const exportPath = path.join(this.settings.hugoExportPath, filename);
@@ -10439,6 +10440,51 @@ draft: false
         alt,
         width: this.settings.enableCloudflareImages ? void 0 : dimensions == null ? void 0 : dimensions.width,
         height: this.settings.enableCloudflareImages ? void 0 : dimensions == null ? void 0 : dimensions.height
+      });
+    });
+  }
+  // Convert HTML <img> tags to Hugo figure shortcodes
+  convertHtmlImages(content) {
+    return content.replace(/<img\s+([^>]*)\/?>/gi, (match, attributesStr) => {
+      var _a, _b;
+      const attributes = {};
+      const attrRegex = /(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+      let attrMatch;
+      while ((attrMatch = attrRegex.exec(attributesStr)) !== null) {
+        const name = attrMatch[1].toLowerCase();
+        const value = (_b = (_a = attrMatch[2]) != null ? _a : attrMatch[3]) != null ? _b : attrMatch[4];
+        attributes[name] = value;
+      }
+      if (!attributes.src) {
+        return match;
+      }
+      const imgSrc = attributes.src;
+      const alt = attributes.alt;
+      const width = attributes.width ? parseInt(attributes.width, 10) : void 0;
+      const height = attributes.height ? parseInt(attributes.height, 10) : void 0;
+      const title = attributes.title;
+      let src;
+      let link;
+      if (this.settings.enableCloudflareImages && this.settings.siteBaseUrl) {
+        const isExternal = imgSrc.startsWith("http://") || imgSrc.startsWith("https://");
+        if (isExternal) {
+          src = this.buildCloudflareImageUrl("/" + imgSrc, width);
+          link = imgSrc;
+        } else {
+          src = this.buildCloudflareImageUrl(imgSrc.startsWith("/") ? imgSrc : "/" + imgSrc, width);
+          link = `${this.settings.siteBaseUrl.replace(/\/$/, "")}${imgSrc.startsWith("/") ? imgSrc : "/" + imgSrc}`;
+        }
+      } else {
+        src = imgSrc;
+        link = void 0;
+      }
+      return this.buildFigureShortcode({
+        src,
+        link,
+        alt,
+        caption: title,
+        width: this.settings.enableCloudflareImages ? void 0 : width,
+        height: this.settings.enableCloudflareImages ? void 0 : height
       });
     });
   }

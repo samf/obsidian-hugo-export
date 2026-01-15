@@ -119,6 +119,9 @@ export default class HugoExportPlugin extends Plugin {
 			// Convert external markdown images to Hugo figure shortcodes
 			content = this.convertExternalImages(content);
 
+			// Convert HTML <img> tags to Hugo figure shortcodes
+			content = this.convertHtmlImages(content);
+
 			const hugoContent = this.convertToHugo(content, file);
 
 			// Create filename based on date and title
@@ -469,6 +472,62 @@ draft: false
 				alt,
 				width: this.settings.enableCloudflareImages ? undefined : dimensions?.width,
 				height: this.settings.enableCloudflareImages ? undefined : dimensions?.height
+			});
+		});
+	}
+
+	// Convert HTML <img> tags to Hugo figure shortcodes
+	convertHtmlImages(content: string): string {
+		// Pattern: <img ...> or <img ... />
+		// This regex captures the entire tag and we'll parse attributes from it
+		return content.replace(/<img\s+([^>]*)\/?>/gi, (match, attributesStr) => {
+			// Parse attributes from the tag
+			const attributes: Record<string, string> = {};
+			const attrRegex = /(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+			let attrMatch;
+
+			while ((attrMatch = attrRegex.exec(attributesStr)) !== null) {
+				const name = attrMatch[1].toLowerCase();
+				const value = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4];
+				attributes[name] = value;
+			}
+
+			// Must have src attribute
+			if (!attributes.src) {
+				return match; // Leave as-is if no src
+			}
+
+			const imgSrc = attributes.src;
+			const alt = attributes.alt;
+			const width = attributes.width ? parseInt(attributes.width, 10) : undefined;
+			const height = attributes.height ? parseInt(attributes.height, 10) : undefined;
+			const title = attributes.title; // Can be used as caption
+
+			let src: string;
+			let link: string | undefined;
+
+			if (this.settings.enableCloudflareImages && this.settings.siteBaseUrl) {
+				// For Cloudflare, transform the URL
+				const isExternal = imgSrc.startsWith('http://') || imgSrc.startsWith('https://');
+				if (isExternal) {
+					src = this.buildCloudflareImageUrl('/' + imgSrc, width);
+					link = imgSrc;
+				} else {
+					src = this.buildCloudflareImageUrl(imgSrc.startsWith('/') ? imgSrc : '/' + imgSrc, width);
+					link = `${this.settings.siteBaseUrl.replace(/\/$/, '')}${imgSrc.startsWith('/') ? imgSrc : '/' + imgSrc}`;
+				}
+			} else {
+				src = imgSrc;
+				link = undefined;
+			}
+
+			return this.buildFigureShortcode({
+				src,
+				link,
+				alt,
+				caption: title,
+				width: this.settings.enableCloudflareImages ? undefined : width,
+				height: this.settings.enableCloudflareImages ? undefined : height
 			});
 		});
 	}
