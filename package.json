@@ -27,6 +27,7 @@
 		"typescript": "^5.3.3"
 	},
 	"dependencies": {
+		"exifreader": "^4.36.0",
 		"js-yaml": "^4.1.1"
 	}
 }

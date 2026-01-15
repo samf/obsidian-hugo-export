@@ -2,19 +2,54 @@ import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'ob
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
+import * as ExifReader from 'exifreader';
+
+// Type definitions for image parsing
+interface ParsedDimensions {
+	width: number;
+	height?: number;
+}
+
+interface ImageMetadata {
+	dimensions?: ParsedDimensions;
+	altText?: string;
+}
+
+interface ParsedInternalImage {
+	filename: string;
+	pipeContent?: string;
+}
+
+interface AttachmentInfo {
+	newFilename: string;
+	caption?: string;
+}
+
+interface FigureOptions {
+	src: string;
+	link?: string;
+	alt?: string;
+	caption?: string;
+	width?: number;
+	height?: number;
+}
 
 interface HugoExportSettings {
 	hugoExportPath: string;
 	hugoAttachmentsPath: string;
 	hugoAttachmentsUrl: string;
 	defaultAuthor: string;
+	enableCloudflareImages: boolean;
+	siteBaseUrl: string;
 }
 
 const DEFAULT_SETTINGS: HugoExportSettings = {
 	hugoExportPath: '',
 	hugoAttachmentsPath: '',
 	hugoAttachmentsUrl: '/images',
-	defaultAuthor: ''
+	defaultAuthor: '',
+	enableCloudflareImages: false,
+	siteBaseUrl: ''
 };
 
 export default class HugoExportPlugin extends Plugin {
@@ -63,23 +98,26 @@ export default class HugoExportPlugin extends Plugin {
 		try {
 			let content = await this.app.vault.read(file);
 
-			// Process attachments if attachments path is configured
-			const attachmentMap = new Map<string, string>();
+			// Process internal attachments if attachments path is configured
+			const attachmentMap = new Map<string, AttachmentInfo>();
 			if (this.settings.hugoAttachmentsPath) {
-				const attachmentNames = this.findAttachments(content);
-				for (const attachmentName of attachmentNames) {
-					const attachmentFile = await this.resolveAttachmentPath(attachmentName, file);
+				const attachments = this.findAttachments(content);
+				for (const attachment of attachments) {
+					const attachmentFile = await this.resolveAttachmentPath(attachment.filename, file);
 					if (attachmentFile) {
-						const newFilename = await this.copyAttachment(attachmentFile, this.settings.hugoAttachmentsPath);
-						attachmentMap.set(attachmentName, newFilename);
+						const info = await this.copyAttachment(attachmentFile, this.settings.hugoAttachmentsPath);
+						attachmentMap.set(attachment.filename, info);
 					} else {
-						console.warn(`Attachment not found: ${attachmentName}`);
+						console.warn(`Attachment not found: ${attachment.filename}`);
 					}
 				}
 
-				// Convert attachment links in content
+				// Convert internal attachment links in content
 				content = this.convertAttachmentLinks(content, attachmentMap, this.settings.hugoAttachmentsUrl);
 			}
+
+			// Convert external markdown images to Hugo figure shortcodes
+			content = this.convertExternalImages(content);
 
 			const hugoContent = this.convertToHugo(content, file);
 
@@ -192,14 +230,17 @@ draft: false
 		return `${sanitized}.md`;
 	}
 
-	findAttachments(content: string): string[] {
+	findAttachments(content: string): ParsedInternalImage[] {
 		// Find Obsidian-style embeds: ![[filename]] or ![[filename|alt]]
-		const embedRegex = /!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
-		const attachments: string[] = [];
+		const embedRegex = /!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g;
+		const attachments: ParsedInternalImage[] = [];
 		let match;
 
 		while ((match = embedRegex.exec(content)) !== null) {
-			attachments.push(match[1]);
+			attachments.push({
+				filename: match[1],
+				pipeContent: match[2]
+			});
 		}
 
 		return attachments;
@@ -234,9 +275,12 @@ draft: false
 		return null;
 	}
 
-	async copyAttachment(attachmentFile: TFile, destDir: string): Promise<string> {
+	async copyAttachment(attachmentFile: TFile, destDir: string): Promise<AttachmentInfo> {
 		// Read the attachment from the vault
 		const content = await this.app.vault.readBinary(attachmentFile);
+
+		// Extract EXIF caption before writing
+		const caption = await this.extractExifCaption(content);
 
 		// Sanitize the filename
 		const sanitizedName = attachmentFile.name.replace(/[^a-z0-9.-]/gi, '-').toLowerCase();
@@ -250,23 +294,182 @@ draft: false
 		const destPath = path.join(destDir, sanitizedName);
 		fs.writeFileSync(destPath, Buffer.from(content));
 
-		return sanitizedName;
+		return {
+			newFilename: sanitizedName,
+			caption
+		};
 	}
 
-	convertAttachmentLinks(content: string, attachmentMap: Map<string, string>, hugoImagePath: string): string {
+	convertAttachmentLinks(content: string, attachmentMap: Map<string, AttachmentInfo>, hugoImagePath: string): string {
 		// Replace ![[filename]] or ![[filename|alt]] with Hugo figure shortcode
-		return content.replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (match, filename, alt) => {
-			const newFilename = attachmentMap.get(filename);
-			if (newFilename) {
-				const src = `${hugoImagePath}/${newFilename}`;
-				if (alt) {
-					return `{{< figure src="${src}" alt="${alt}" caption="${alt}" >}}`;
-				} else {
-					return `{{< figure src="${src}" >}}`;
-				}
+		return content.replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (match, filename, pipeContent) => {
+			const info = attachmentMap.get(filename);
+			if (!info) {
+				return match; // Not found, leave as-is
 			}
-			// If not found in map, leave as-is
-			return match;
+
+			const metadata = this.parsePipeContent(pipeContent);
+			const directUrl = `${hugoImagePath}/${info.newFilename}`;
+
+			let src: string;
+			let link: string | undefined;
+
+			if (this.settings.enableCloudflareImages && this.settings.siteBaseUrl) {
+				src = this.buildCloudflareImageUrl(directUrl, metadata.dimensions?.width);
+				link = `${this.settings.siteBaseUrl.replace(/\/$/, '')}${directUrl}`;
+			} else {
+				src = directUrl;
+				link = undefined;
+			}
+
+			return this.buildFigureShortcode({
+				src,
+				link,
+				alt: metadata.altText,
+				caption: info.caption,
+				width: this.settings.enableCloudflareImages ? undefined : metadata.dimensions?.width,
+				height: this.settings.enableCloudflareImages ? undefined : metadata.dimensions?.height
+			});
+		});
+	}
+
+	// Parse pipe content to determine if it's dimensions or alt text
+	parsePipeContent(pipeContent: string | undefined): ImageMetadata {
+		if (!pipeContent) {
+			return {};
+		}
+
+		// Pattern: "500" (width only) or "500x300" (width x height)
+		const dimensionPattern = /^(\d+)(?:x(\d+))?$/;
+		const match = pipeContent.match(dimensionPattern);
+
+		if (match) {
+			return {
+				dimensions: {
+					width: parseInt(match[1], 10),
+					height: match[2] ? parseInt(match[2], 10) : undefined
+				}
+			};
+		}
+
+		// Not dimensions, treat as alt text
+		return {
+			altText: pipeContent
+		};
+	}
+
+	// Build a Hugo figure shortcode with the given options
+	buildFigureShortcode(options: FigureOptions): string {
+		const attrs: string[] = [];
+
+		attrs.push(`src="${options.src}"`);
+
+		if (options.link) {
+			attrs.push(`link="${options.link}"`);
+		}
+		if (options.alt) {
+			attrs.push(`alt="${options.alt}"`);
+		}
+		if (options.caption) {
+			// Escape quotes in caption
+			const escapedCaption = options.caption.replace(/"/g, '\\"');
+			attrs.push(`caption="${escapedCaption}"`);
+		}
+		if (options.width) {
+			attrs.push(`width="${options.width}"`);
+		}
+		if (options.height) {
+			attrs.push(`height="${options.height}"`);
+		}
+
+		return `{{< figure ${attrs.join(' ')} >}}`;
+	}
+
+	// Build a Cloudflare Images transform URL
+	buildCloudflareImageUrl(imagePath: string, width?: number): string {
+		const baseUrl = this.settings.siteBaseUrl.replace(/\/$/, '');
+
+		let transformOptions = 'fit=scale-down';
+		if (width) {
+			transformOptions += `,width=${width}`;
+		}
+
+		return `${baseUrl}/cdn-cgi/image/${transformOptions}${imagePath}`;
+	}
+
+	// Extract caption from EXIF metadata
+	async extractExifCaption(buffer: ArrayBuffer): Promise<string | undefined> {
+		try {
+			const tags = ExifReader.load(buffer, { expanded: true }) as any;
+
+			// Priority order: IPTC Caption-Abstract > ImageDescription > UserComment
+			// Check IPTC first (most commonly used for captions)
+			if (tags.iptc?.['Caption/Abstract']?.description) {
+				return String(tags.iptc['Caption/Abstract'].description);
+			}
+
+			// Check EXIF ImageDescription
+			if (tags.exif?.ImageDescription?.description) {
+				return String(tags.exif.ImageDescription.description);
+			}
+
+			// Check EXIF UserComment
+			if (tags.exif?.UserComment?.description) {
+				return String(tags.exif.UserComment.description);
+			}
+
+			return undefined;
+		} catch (error) {
+			console.warn('Failed to extract EXIF caption:', error);
+			return undefined;
+		}
+	}
+
+	// Convert external markdown images to Hugo figure shortcodes
+	convertExternalImages(content: string): string {
+		// Pattern: ![alt](url) - but avoid matching already converted shortcodes
+		return content.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, altOrDims, url) => {
+			// Skip if it looks like it's already been processed or is not an image URL
+			if (url.startsWith('{{') || url.startsWith('#')) {
+				return match;
+			}
+
+			let alt: string | undefined;
+			let dimensions: ParsedDimensions | undefined;
+
+			// Check if alt contains dimensions: "alt|500" or "alt|500x300"
+			const pipeIndex = altOrDims.lastIndexOf('|');
+			if (pipeIndex !== -1) {
+				const possibleDims = altOrDims.substring(pipeIndex + 1);
+				const metadata = this.parsePipeContent(possibleDims);
+				if (metadata.dimensions) {
+					alt = altOrDims.substring(0, pipeIndex) || undefined;
+					dimensions = metadata.dimensions;
+				} else {
+					alt = altOrDims || undefined;
+				}
+			} else {
+				alt = altOrDims || undefined;
+			}
+
+			let src: string;
+			let link: string | undefined;
+
+			if (this.settings.enableCloudflareImages && this.settings.siteBaseUrl) {
+				src = this.buildCloudflareImageUrl('/' + url, dimensions?.width);
+				link = url;
+			} else {
+				src = url;
+				link = undefined;
+			}
+
+			return this.buildFigureShortcode({
+				src,
+				link,
+				alt,
+				width: this.settings.enableCloudflareImages ? undefined : dimensions?.width,
+				height: this.settings.enableCloudflareImages ? undefined : dimensions?.height
+			});
 		});
 	}
 }
@@ -325,6 +528,27 @@ class HugoExportSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.defaultAuthor)
 				.onChange(async (value) => {
 					this.plugin.settings.defaultAuthor = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Enable Cloudflare Images')
+			.setDesc('Use Cloudflare Image transformations for resizing images')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableCloudflareImages)
+				.onChange(async (value) => {
+					this.plugin.settings.enableCloudflareImages = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Site base URL')
+			.setDesc('Your site URL for Cloudflare Images (e.g., https://myblog.com)')
+			.addText(text => text
+				.setPlaceholder('https://myblog.com')
+				.setValue(this.plugin.settings.siteBaseUrl)
+				.onChange(async (value) => {
+					this.plugin.settings.siteBaseUrl = value;
 					await this.plugin.saveSettings();
 				}));
 	}
