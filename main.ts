@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import * as ExifReader from 'exifreader';
+import * as TOML from '@iarna/toml';
 
 // Type definitions for image parsing
 interface ParsedDimensions {
@@ -35,6 +36,7 @@ interface FigureOptions {
 }
 
 interface HugoExportSettings {
+	hugoProjectPath: string;
 	hugoExportPath: string;
 	hugoAttachmentsPath: string;
 	hugoAttachmentsUrl: string;
@@ -44,6 +46,7 @@ interface HugoExportSettings {
 }
 
 const DEFAULT_SETTINGS: HugoExportSettings = {
+	hugoProjectPath: '',
 	hugoExportPath: '',
 	hugoAttachmentsPath: '',
 	hugoAttachmentsUrl: '/images',
@@ -51,6 +54,45 @@ const DEFAULT_SETTINGS: HugoExportSettings = {
 	enableCloudflareImages: false,
 	siteBaseUrl: ''
 };
+
+// Hugo config file structure (partial - only what we need)
+interface HugoConfig {
+	baseURL?: string;
+	contentDir?: string;
+	staticDir?: string;
+	params?: {
+		author?: string;
+		[key: string]: any;
+	};
+	author?: string;
+	[key: string]: any;
+}
+
+// Load Hugo configuration from project directory
+function loadHugoConfig(projectPath: string): HugoConfig | null {
+	const configFiles = ['hugo.toml', 'hugo.yaml', 'hugo.json', 'config.toml', 'config.yaml', 'config.json'];
+
+	for (const filename of configFiles) {
+		const configPath = path.join(projectPath, filename);
+		if (fs.existsSync(configPath)) {
+			try {
+				const content = fs.readFileSync(configPath, 'utf-8');
+
+				if (filename.endsWith('.toml')) {
+					return TOML.parse(content) as HugoConfig;
+				} else if (filename.endsWith('.yaml')) {
+					return yaml.load(content) as HugoConfig;
+				} else if (filename.endsWith('.json')) {
+					return JSON.parse(content) as HugoConfig;
+				}
+			} catch (error) {
+				console.warn(`Failed to parse ${filename}:`, error);
+			}
+		}
+	}
+
+	return null;
+}
 
 export default class HugoExportPlugin extends Plugin {
 	settings: HugoExportSettings;
@@ -87,6 +129,57 @@ export default class HugoExportPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	// Apply defaults from Hugo config file (only fills empty settings)
+	async applyHugoConfigDefaults(): Promise<{ applied: string[], errors: string[] }> {
+		const applied: string[] = [];
+		const errors: string[] = [];
+
+		if (!this.settings.hugoProjectPath) {
+			errors.push('Hugo project path is not set');
+			return { applied, errors };
+		}
+
+		const config = loadHugoConfig(this.settings.hugoProjectPath);
+		if (!config) {
+			errors.push('Could not find or parse Hugo config file');
+			return { applied, errors };
+		}
+
+		const projectPath = this.settings.hugoProjectPath;
+
+		// Apply baseURL -> siteBaseUrl
+		if (!this.settings.siteBaseUrl && config.baseURL) {
+			this.settings.siteBaseUrl = config.baseURL.replace(/\/$/, ''); // Remove trailing slash
+			applied.push(`siteBaseUrl: ${this.settings.siteBaseUrl}`);
+		}
+
+		// Apply contentDir -> hugoExportPath
+		if (!this.settings.hugoExportPath) {
+			const contentDir = config.contentDir || 'content';
+			this.settings.hugoExportPath = path.join(projectPath, contentDir, 'posts');
+			applied.push(`hugoExportPath: ${this.settings.hugoExportPath}`);
+		}
+
+		// Apply staticDir -> hugoAttachmentsPath
+		if (!this.settings.hugoAttachmentsPath) {
+			const staticDir = config.staticDir || 'static';
+			this.settings.hugoAttachmentsPath = path.join(projectPath, staticDir, 'images');
+			applied.push(`hugoAttachmentsPath: ${this.settings.hugoAttachmentsPath}`);
+		}
+
+		// Apply author -> defaultAuthor
+		if (!this.settings.defaultAuthor) {
+			const author = config.params?.author || config.author;
+			if (author) {
+				this.settings.defaultAuthor = author;
+				applied.push(`defaultAuthor: ${this.settings.defaultAuthor}`);
+			}
+		}
+
+		await this.saveSettings();
+		return { applied, errors };
 	}
 
 	async exportToHugo(file: TFile) {
@@ -545,6 +638,31 @@ class HugoExportSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 
 		containerEl.empty();
+
+		new Setting(containerEl)
+			.setName('Hugo project path')
+			.setDesc('Path to your Hugo project root (containing hugo.toml)')
+			.addText(text => text
+				.setPlaceholder('/path/to/hugo/project')
+				.setValue(this.plugin.settings.hugoProjectPath)
+				.onChange(async (value) => {
+					this.plugin.settings.hugoProjectPath = value;
+					await this.plugin.saveSettings();
+				}))
+			.addButton(button => button
+				.setButtonText('Load defaults')
+				.onClick(async () => {
+					const result = await this.plugin.applyHugoConfigDefaults();
+					if (result.errors.length > 0) {
+						new Notice(result.errors.join('\n'));
+					} else if (result.applied.length > 0) {
+						new Notice(`Loaded: ${result.applied.length} settings from Hugo config`);
+						// Refresh the display to show new values
+						this.display();
+					} else {
+						new Notice('No empty settings to fill');
+					}
+				}));
 
 		new Setting(containerEl)
 			.setName('Hugo export path')

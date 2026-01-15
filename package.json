@@ -27,6 +27,7 @@
 		"typescript": "^5.3.3"
 	},
 	"dependencies": {
+		"@iarna/toml": "^2.2.5",
 		"exifreader": "^4.36.0",
 		"js-yaml": "^4.1.1"
 	}
